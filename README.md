@@ -36,10 +36,19 @@ The system uses a LangGraph workflow that:
 3. Install required packages:
 
 ```bash
-pip install -U langchain-nomic langchain_community tiktoken langchainhub chromadb langchain langgraph tavily-python nomic[local]
+pip install -U langchain-nomic langchain_community tiktoken langchainhub chromadb langchain langgraph tavily-python nomic[local] python-dotenv
 ```
 
-4. Set up API keys for Tavily and Nomic
+4. Create a `.env` file in the project root with the following content:
+```
+TAVILY_API_KEY=your_tavily_api_key_here
+NOMIC_API_KEY=your_nomic_api_key_here
+# Uncomment if using LangSmith
+# LANGCHAIN_API_KEY=your_langchain_api_key_here
+# LANGCHAIN_PROJECT=your_langchain_project_name_here
+```
+
+5. Replace the placeholder values with your actual API keys
 
 ## Key Components
 
@@ -60,7 +69,26 @@ The notebook includes an example query "What is the AlphaCodium paper about?" th
 
 ## LangSmith Integration
 
-This project includes LangSmith integration for monitoring and debugging. You can view traces of the workflow execution for analysis.
+This project includes LangSmith integration for monitoring, debugging, and analyzing the workflow. To enable tracing:
+
+1. Create a [LangSmith](https://smith.langchain.com/) account
+2. Get your API key from the LangSmith dashboard
+3. Add the following environment variables to your `.env` file:
+   ```
+   LANGCHAIN_API_KEY=your_langchain_api_key_here
+   LANGCHAIN_PROJECT=adaptive-rag-local
+   # Optional: Specify organization ID if you're part of multiple organizations
+   # LANGCHAIN_ORG_ID=your_org_id
+   ```
+
+With LangSmith tracing enabled, you can:
+- Visualize the complete flow of your graph execution
+- Debug issues in complex workflows
+- Analyze performance metrics (latency, token usage)
+- Provide feedback on runs to improve your application
+- Share traces with others for collaboration
+
+The notebook will display links to view traces in the LangSmith UI after each execution.
 
 ## License
 
