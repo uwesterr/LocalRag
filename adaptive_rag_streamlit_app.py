@@ -93,6 +93,8 @@ def check_for_new_documents(doc_dir):
             if os.path.isfile(fp) and fp not in existing:
                 new_files.append(os.path.basename(fp))
         
+        if new_files:
+            st.session_state.rebuild_index = True
         return new_files
     except:
         return []
@@ -278,7 +280,8 @@ def initialize_index(doc_dir, db_dir, rebuild=False):
             vs = Chroma(persist_directory=db_dir, embedding_function=emb, collection_name="rag-chroma")
             existing = {md.get("source") for md in vs.get()["metadatas"] or []}
         except:
-            vs = Chroma.from_documents([], emb, persist_directory=db_dir, collection_name="rag-chroma")
+            os.makedirs(db_dir, exist_ok=True)
+            vs = Chroma(persist_directory=db_dir, embedding_function=emb, collection_name="rag-chroma")
             existing = set()
     
     # 4) Loader factory
@@ -302,19 +305,20 @@ def initialize_index(doc_dir, db_dir, rebuild=False):
             new_docs += load_path(fp)
     
     if new_docs:
-        # 6) Split into chunks
         splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=250, chunk_overlap=0)
         chunks = splitter.split_documents(new_docs)
-        
-        # 7) Add to DB
-        vs.add_documents(chunks)
-        vs.persist()
-        doc_count = len(chunks)
-        
-        # 8) Track new docs
-        st.session_state.new_docs_added = new_file_paths
-        st.session_state.total_docs = doc_count
-        st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
+        if chunks:
+            vs.add_documents(chunks)
+            vs.persist()
+            existing_count = len(existing) if existing else 0
+            doc_count = existing_count + len(chunks)
+            st.session_state.new_docs_added = new_file_paths
+            st.session_state.total_docs = doc_count
+            st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            doc_count = len(existing) if existing else 0
+            st.session_state.new_docs_added = []
+            st.session_state.total_docs = doc_count
     else:
         doc_count = sum(1 for _ in existing)
         st.session_state.new_docs_added = []
@@ -564,7 +568,7 @@ def initialize_langgraph(local_llm):
 try:
     # Check if we need to rebuild the index
     if st.session_state.rebuild_index:
-        retriever, doc_count = initialize_index(doc_dir, db_dir, rebuild=True)
+        retriever, doc_count = initialize_index(doc_dir, db_dir)
         st.session_state.retriever = retriever
         st.session_state.doc_count = doc_count
         st.session_state.rebuild_index = False
