@@ -74,6 +74,29 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# Check for new documents
+def check_for_new_documents(doc_dir):
+    """Check if there are new documents in the directory that haven't been indexed yet"""
+    if 'retriever' not in st.session_state or not st.session_state.retriever:
+        return []
+    
+    all_files = glob.glob(os.path.join(doc_dir, "**", "*"), recursive=True)
+    
+    # Get existing documents from the vector store
+    try:
+        vs = st.session_state.retriever.vectorstore
+        existing = {md.get("source") for md in vs.get()["metadatas"] or []}
+        
+        # Find new documents
+        new_files = []
+        for fp in all_files:
+            if os.path.isfile(fp) and fp not in existing:
+                new_files.append(os.path.basename(fp))
+        
+        return new_files
+    except:
+        return []
+
 # Sidebar: setup and configuration
 with st.sidebar:
     st.title("🔍 Adaptive RAG")
@@ -83,11 +106,44 @@ with st.sidebar:
     load_dotenv()
     
     # LLM model selection
-    local_llm = st.selectbox(
-        "Select Local LLM Model",
-        ["mistral", "mixtral", "llama3", "command-r"],
-        index=0
-    )
+    try:
+        import subprocess
+        result = subprocess.run(["ollama", "list"], capture_output=True, text=True)
+        lines = result.stdout.strip().splitlines()
+        if lines and "MODEL" in lines[0].upper() or "NAME" in lines[0].upper():
+            lines = lines[1:]  # Skip header row
+            
+        # Parse model names exactly as they appear in Ollama list output
+        available_models = []
+        for line in lines:
+            if line.strip():
+                # Extract the full model name with tag (e.g., "llama3:latest")
+                model_name = line.split()[0]
+                available_models.append({"display": model_name, "value": model_name})
+        
+        # If no models were found, use defaults
+        if not available_models:
+            available_models = [
+                {"display": "mistral:latest", "value": "mistral:latest"},
+                {"display": "mixtral:latest", "value": "mixtral:latest"},
+                {"display": "llama3:latest", "value": "llama3:latest"},
+                {"display": "command-r:latest", "value": "command-r:latest"}
+            ]
+    except Exception as e:
+        st.warning(f"Error getting Ollama models: {str(e)}")
+        available_models = [
+            {"display": "mistral:latest", "value": "mistral:latest"},
+            {"display": "mixtral:latest", "value": "mixtral:latest"},
+            {"display": "llama3:latest", "value": "llama3:latest"},
+            {"display": "command-r:latest", "value": "command-r:latest"}
+        ]
+    
+    # Create options for the selectbox with display names
+    model_options = [m["display"] for m in available_models]
+    selected_display = st.selectbox("Select Local LLM Model", model_options, index=0)
+    
+    # Get the actual model value for the selected display name
+    local_llm = next((m["value"] for m in available_models if m["display"] == selected_display), selected_display)
     
     # Check and display API keys status
     st.markdown("### API Keys Status")
@@ -536,29 +592,6 @@ try:
             st.success("Successfully initialized Adaptive RAG components")
 except Exception as e:
     st.error(f"Error initializing components: {str(e)}")
-
-# Check for new documents
-def check_for_new_documents(doc_dir):
-    """Check if there are new documents in the directory that haven't been indexed yet"""
-    if 'retriever' not in st.session_state or not st.session_state.retriever:
-        return []
-    
-    all_files = glob.glob(os.path.join(doc_dir, "**", "*"), recursive=True)
-    
-    # Get existing documents from the vector store
-    try:
-        vs = st.session_state.retriever.vectorstore
-        existing = {md.get("source") for md in vs.get()["metadatas"] or []}
-        
-        # Find new documents
-        new_files = []
-        for fp in all_files:
-            if os.path.isfile(fp) and fp not in existing:
-                new_files.append(os.path.basename(fp))
-        
-        return new_files
-    except:
-        return []
 
 # Main interface - Question input
 question = st.text_input("Ask a question:", placeholder="e.g., What is the orbit of Eagle-1?")
