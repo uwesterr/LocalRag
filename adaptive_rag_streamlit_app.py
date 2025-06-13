@@ -467,7 +467,8 @@ def initialize_langgraph(local_llm):
         docs = web_search_tool.invoke({"query": question})
         web_results = "\n".join([d["content"] for d in docs])
         web_results = Document(page_content=web_results)
-        return {"documents": web_results, "question": question}
+        # Downstream components expect a list of Documents
+        return {"documents": [web_results], "question": question}
 
     # Define conditional edges
     def route_question(state):
