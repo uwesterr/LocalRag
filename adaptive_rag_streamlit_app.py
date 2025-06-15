@@ -417,11 +417,11 @@ def initialize_langgraph(local_llm):
         Attributes:
             question: question
             generation: LLM generation
-            documents: list of documents
+            documents: list of LangChain ``Document`` objects
         """
         question: str
         generation: str
-        documents: List[str]
+        documents: List[Document]
     
     # Define the nodes
     def retrieve(state):
