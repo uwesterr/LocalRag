@@ -63,6 +63,12 @@ NOMIC_API_KEY=your_nomic_api_key_here
 
 Run the Jupyter notebook `langgraph_adaptive_rag_local.ipynb` to explore the implementation.
 
+### Project Documents
+
+Create a subfolder under `docs/` for each project (e.g. `docs/project_alpha`).
+The app automatically builds a separate vector database in `db/<project>` for every subfolder.
+Select the desired project in the sidebar when running the Streamlit app.
+
 ## Example
 
 The notebook includes an example query "What is the AlphaCodium paper about?" that demonstrates the full adaptive RAG workflow.

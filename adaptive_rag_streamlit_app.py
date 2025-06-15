@@ -75,16 +75,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Check for new documents
-def check_for_new_documents(doc_dir):
-    """Check if there are new documents in the directory that haven't been indexed yet"""
-    if 'retriever' not in st.session_state or not st.session_state.retriever:
+def check_for_new_documents(doc_dir, project):
+    """Check if there are new documents in a project directory that haven't been indexed yet"""
+    if 'retrievers' not in st.session_state or project not in st.session_state.retrievers:
         return []
     
     all_files = glob.glob(os.path.join(doc_dir, "**", "*"), recursive=True)
     
     # Get existing documents from the vector store
     try:
-        vs = st.session_state.retriever.vectorstore
+        vs = st.session_state.retrievers[project].vectorstore
         existing = {md.get("source") for md in vs.get()["metadatas"] or []}
         
         # Find new documents
@@ -158,37 +158,51 @@ with st.sidebar:
     
     # Index management
     st.markdown("### Document Index")
-    doc_dir = st.text_input("Documents Directory", value="docs")
-    db_dir = st.text_input("Database Directory", value="./db")
+    doc_root = st.text_input("Documents Directory", value="docs")
+    db_root = st.text_input("Database Directory", value="./db")
+
+    projects = [d for d in os.listdir(doc_root) if os.path.isdir(os.path.join(doc_root, d))]
+    if projects:
+        selected_project = st.selectbox("Select Project", projects)
+    else:
+        st.warning("No project folders found")
+        selected_project = None
+    st.session_state.current_project = selected_project
     
     # Display index statistics
-    if 'total_docs' in st.session_state and st.session_state.total_docs > 0:
-        st.info(f"📚 Current index contains {st.session_state.total_docs} document chunks")
-        
+    if selected_project and selected_project in st.session_state.project_doc_counts:
+        count = st.session_state.project_doc_counts.get(selected_project, 0)
+        st.info(f"📚 Current index for {selected_project} contains {count} document chunks")
+
         # Show last update timestamp if available
-        if st.session_state.last_index_update:
-            st.caption(f"Last updated: {st.session_state.last_index_update}")
+        if st.session_state.last_index_update.get(selected_project):
+            st.caption(f"Last updated: {st.session_state.last_index_update[selected_project]}")
     
     # Display pending docs notification
-    if 'pending_docs' in st.session_state and st.session_state.pending_docs:
-        st.warning(f"⚠️ {len(st.session_state.pending_docs)} document(s) not indexed yet. Click 'Rebuild Index' to include them.")
+    if selected_project and selected_project in st.session_state.pending_docs and st.session_state.pending_docs[selected_project]:
+        st.warning(f"⚠️ {len(st.session_state.pending_docs[selected_project])} document(s) not indexed yet. Click 'Rebuild Index' to include them.")
     
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Check for New Docs"):
-            new_files = check_for_new_documents(doc_dir)
+            if selected_project:
+                new_files = check_for_new_documents(os.path.join(doc_root, selected_project), selected_project)
+            else:
+                new_files = []
             if new_files:
-                st.session_state.pending_docs = new_files
+                st.session_state.pending_docs[selected_project] = new_files
                 st.warning(f"Found {len(new_files)} new document(s): {', '.join(new_files)}")
             else:
                 st.success("No new documents found")
-                st.session_state.pending_docs = []
+                if selected_project:
+                    st.session_state.pending_docs[selected_project] = []
     
     with col2:
         if st.button("Rebuild Index"):
             with st.spinner("Rebuilding index..."):
                 st.session_state.rebuild_index = True
-                st.session_state.pending_docs = []
+                if selected_project:
+                    st.session_state.pending_docs[selected_project] = []
     
     # Display LangSmith status
     st.markdown("### LangSmith Integration")
@@ -234,8 +248,10 @@ It uses query analysis to route between web search for recent events and RAG for
 """)
 
 # Initialize session state variables
-if 'retriever' not in st.session_state:
-    st.session_state.retriever = None
+if 'retrievers' not in st.session_state:
+    st.session_state.retrievers = {}
+if 'current_project' not in st.session_state:
+    st.session_state.current_project = None
 if 'app' not in st.session_state:
     st.session_state.app = None
 if 'rebuild_index' not in st.session_state:
@@ -249,17 +265,17 @@ if 'execution_trace' not in st.session_state:
 if 'graph_image' not in st.session_state:
     st.session_state.graph_image = None
 if 'new_docs_added' not in st.session_state:
-    st.session_state.new_docs_added = []
-if 'total_docs' not in st.session_state:
-    st.session_state.total_docs = 0
+    st.session_state.new_docs_added = {}
+if 'project_doc_counts' not in st.session_state:
+    st.session_state.project_doc_counts = {}
 if 'pending_docs' not in st.session_state:
-    st.session_state.pending_docs = []
+    st.session_state.pending_docs = {}
 if 'last_index_update' not in st.session_state:
-    st.session_state.last_index_update = None
+    st.session_state.last_index_update = {}
 
 # Create or load index
 @st.cache_resource
-def initialize_index(doc_dir, db_dir, rebuild=False):
+def initialize_index(doc_dir, db_dir, rebuild=False, project=None):
     # 1) Find all files
     all_files = glob.glob(os.path.join(doc_dir, "**", "*"), recursive=True)
     
@@ -312,26 +328,55 @@ def initialize_index(doc_dir, db_dir, rebuild=False):
             vs.persist()
             existing_count = len(existing) if existing else 0
             doc_count = existing_count + len(chunks)
-            st.session_state.new_docs_added = new_file_paths
-            st.session_state.total_docs = doc_count
-            st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
+            if project is not None:
+                st.session_state.new_docs_added[project] = new_file_paths
+                st.session_state.project_doc_counts[project] = doc_count
+                st.session_state.last_index_update[project] = time.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                st.session_state.new_docs_added = new_file_paths
+                st.session_state.total_docs = doc_count
+                st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
         else:
             doc_count = len(existing) if existing else 0
-            st.session_state.new_docs_added = []
-            st.session_state.total_docs = doc_count
+            if project is not None:
+                st.session_state.new_docs_added[project] = []
+                st.session_state.project_doc_counts[project] = doc_count
+            else:
+                st.session_state.new_docs_added = []
+                st.session_state.total_docs = doc_count
     else:
         doc_count = sum(1 for _ in existing)
-        st.session_state.new_docs_added = []
-        st.session_state.total_docs = doc_count
+        if project is not None:
+            st.session_state.new_docs_added[project] = []
+            st.session_state.project_doc_counts[project] = doc_count
+        else:
+            st.session_state.new_docs_added = []
+            st.session_state.total_docs = doc_count
         
         # Update timestamp only if it's a rebuild
         if rebuild:
-            st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
+            if project is not None:
+                st.session_state.last_index_update[project] = time.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
     
     # 9) Build retriever
     retriever = vs.as_retriever()
-    
-    return retriever, doc_count
+
+    return retriever, doc_count, new_file_paths
+
+# Create or load indexes for all project folders
+def initialize_project_indexes(doc_root, db_root, rebuild=False):
+    projects = [d for d in os.listdir(doc_root) if os.path.isdir(os.path.join(doc_root, d))]
+    retrievers = {}
+    counts = {}
+    for project in projects:
+        proj_doc = os.path.join(doc_root, project)
+        proj_db = os.path.join(db_root, project)
+        retr, cnt, _ = initialize_index(proj_doc, proj_db, rebuild=rebuild, project=project)
+        retrievers[project] = retr
+        counts[project] = cnt
+    return retrievers, counts
 
 # Initialize the components for the LangGraph
 @st.cache_resource(show_spinner=False)
@@ -566,27 +611,28 @@ def initialize_langgraph(local_llm):
 
 # Initialize the document index and langgraph
 try:
-    # Check if we need to rebuild the index
-    if st.session_state.rebuild_index:
-        retriever, doc_count = initialize_index(doc_dir, db_dir)
-        st.session_state.retriever = retriever
-        st.session_state.doc_count = doc_count
+    if st.session_state.rebuild_index or not st.session_state.retrievers:
+        retrievers, counts = initialize_project_indexes(doc_root, db_root, rebuild=st.session_state.rebuild_index)
+        st.session_state.retrievers = retrievers
+        st.session_state.project_doc_counts = counts
         st.session_state.rebuild_index = False
-        
-        # Display new document indicator after rebuild
-        if st.session_state.new_docs_added:
-            st.success(f"✨ Added {len(st.session_state.new_docs_added)} new document(s) to index: {', '.join(st.session_state.new_docs_added)}")
-        st.success(f"Successfully rebuilt index with {doc_count} document chunks")
-    elif not st.session_state.retriever:
-        retriever, doc_count = initialize_index(doc_dir, db_dir)
-        st.session_state.retriever = retriever
-        st.session_state.doc_count = doc_count
-        
-        # Display new document indicator
-        if st.session_state.new_docs_added:
-            st.success(f"✨ Added {len(st.session_state.new_docs_added)} new document(s) to index: {', '.join(st.session_state.new_docs_added)}")
-        st.info(f"Loaded index with {doc_count} document chunks")
-    
+
+        if selected_project and st.session_state.new_docs_added.get(selected_project):
+            added = st.session_state.new_docs_added[selected_project]
+            st.success(f"✨ Added {len(added)} new document(s) to index: {', '.join(added)}")
+        if selected_project:
+            st.success(f"Successfully built index for {selected_project} with {counts.get(selected_project,0)} document chunks")
+    elif selected_project and selected_project not in st.session_state.retrievers:
+        retrievers, counts = initialize_project_indexes(doc_root, db_root)
+        st.session_state.retrievers.update(retrievers)
+        st.session_state.project_doc_counts.update(counts)
+
+    # Set active retriever
+    if selected_project:
+        st.session_state.retriever = st.session_state.retrievers.get(selected_project)
+    else:
+        st.session_state.retriever = None
+
     # Initialize the LangGraph components
     if st.session_state.retriever and not st.session_state.app:
         with st.spinner("Initializing Adaptive RAG components..."):
