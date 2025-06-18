@@ -12,8 +12,8 @@ import time
 # LangChain imports
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_nomic.embeddings import NomicEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.document_loaders import TextLoader, PyPDFLoader
+from langchain_community.vectorstores import Chroma
+from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain.prompts import PromptTemplate
 from langchain_community.chat_models import ChatOllama
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
@@ -74,30 +74,80 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Check for new documents
-def check_for_new_documents(doc_dir):
-    """Check if there are new documents in the directory that haven't been indexed yet"""
-    if 'retriever' not in st.session_state or not st.session_state.retriever:
+# Initialize session state variables
+if 'retrievers' not in st.session_state: st.session_state.retrievers = {}
+if 'current_project' not in st.session_state: st.session_state.current_project = None
+if 'app' not in st.session_state: st.session_state.app = None
+if 'rebuild_index' not in st.session_state: st.session_state.rebuild_index = False
+if 'question_history' not in st.session_state: st.session_state.question_history = []
+if 'answer_history' not in st.session_state: st.session_state.answer_history = []
+if 'execution_trace' not in st.session_state: st.session_state.execution_trace = []
+if 'graph_image' not in st.session_state: st.session_state.graph_image = None
+if 'new_docs_added' not in st.session_state: st.session_state.new_docs_added = {}
+if 'project_doc_counts' not in st.session_state: st.session_state.project_doc_counts = {}
+if 'pending_docs' not in st.session_state: st.session_state.pending_docs = {}
+if 'last_index_update' not in st.session_state: st.session_state.last_index_update = {}
+
+def check_for_new_documents(doc_dir, project=None):
+    """
+    Check for new documents in the specified directory that haven't been indexed yet.
+    
+    Args:
+        doc_dir (str): Directory to check for documents
+        project (str, optional): Project name for tracking in session state
+    
+    Returns:
+        list: List of new document filenames
+    """
+    if not os.path.exists(doc_dir):
         return []
     
-    all_files = glob.glob(os.path.join(doc_dir, "**", "*"), recursive=True)
+    # Get all document files in the directory
+    all_files = []
+    for ext in [".pdf", ".txt", ".md", ".docx"]:
+        all_files.extend(glob.glob(os.path.join(doc_dir, "**", f"*{ext}"), recursive=True))
     
-    # Get existing documents from the vector store
-    try:
-        vs = st.session_state.retriever.vectorstore
-        existing = {md.get("source") for md in vs.get()["metadatas"] or []}
+    # Get the relative paths for easier display
+    all_files = [os.path.relpath(f, doc_dir) for f in all_files]
+    
+    # Check which files are already indexed
+    if project is not None:
+        # For multi-project setup
+        retriever = st.session_state.retrievers.get(project)
+        if retriever is None:
+            return all_files  # If retriever not initialized, all files are "new"
         
-        # Find new documents
-        new_files = []
-        for fp in all_files:
-            if os.path.isfile(fp) and fp not in existing:
-                new_files.append(os.path.basename(fp))
-        
-        if new_files:
-            st.session_state.rebuild_index = True
-        return new_files
-    except:
-        return []
+        # Get indexed files from the retriever
+        try:
+            vs = retriever.vectorstore
+            indexed_files = {
+                os.path.relpath(md.get("source", ""), doc_dir) 
+                for md in vs.get()["metadatas"] or []
+                if md and "source" in md
+            }
+        except Exception as e:
+            st.error(f"Error checking indexed files: {str(e)}")
+            return []
+    else:
+        # For single project setup
+        if 'retriever' not in st.session_state or st.session_state.retriever is None:
+            return all_files
+            
+        try:
+            vs = st.session_state.retriever.vectorstore
+            indexed_files = {
+                os.path.relpath(md.get("source", ""), doc_dir) 
+                for md in vs.get()["metadatas"] or []
+                if md and "source" in md
+            }
+        except Exception as e:
+            st.error(f"Error checking indexed files: {str(e)}")
+            return []
+    
+    # Find files that aren't indexed
+    new_files = [f for f in all_files if f not in indexed_files]
+    
+    return new_files
 
 # Sidebar: setup and configuration
 with st.sidebar:
@@ -114,7 +164,7 @@ with st.sidebar:
         lines = result.stdout.strip().splitlines()
         if lines and "MODEL" in lines[0].upper() or "NAME" in lines[0].upper():
             lines = lines[1:]  # Skip header row
-            
+
         # Parse model names exactly as they appear in Ollama list output
         available_models = []
         for line in lines:
@@ -122,7 +172,8 @@ with st.sidebar:
                 # Extract the full model name with tag (e.g., "llama3:latest")
                 model_name = line.split()[0]
                 available_models.append({"display": model_name, "value": model_name})
-        
+        # Exclude non-chat (embedding) models
+        available_models = [m for m in available_models if "embed-text" not in m["value"]]
         # If no models were found, use defaults
         if not available_models:
             available_models = [
@@ -158,37 +209,57 @@ with st.sidebar:
     
     # Index management
     st.markdown("### Document Index")
-    doc_dir = st.text_input("Documents Directory", value="docs")
-    db_dir = st.text_input("Database Directory", value="./db")
+    doc_root = st.text_input("Documents Directory", value="docs")
+    db_root = st.text_input("Database Directory", value="./db")
+
+    projects = [d for d in os.listdir(doc_root) if os.path.isdir(os.path.join(doc_root, d))]
+    if projects:
+        selected_project = st.selectbox("Select Project", projects)
+    else:
+        st.warning("No project folders found")
+        selected_project = None
+    st.session_state.current_project = selected_project
     
     # Display index statistics
-    if 'total_docs' in st.session_state and st.session_state.total_docs > 0:
-        st.info(f"📚 Current index contains {st.session_state.total_docs} document chunks")
-        
+    if selected_project:
+        count = st.session_state.project_doc_counts.get(selected_project, 0)
+        st.info(f"📚 Current index for {selected_project} contains {count} document chunks")
+
         # Show last update timestamp if available
-        if st.session_state.last_index_update:
-            st.caption(f"Last updated: {st.session_state.last_index_update}")
+        if st.session_state.last_index_update.get(selected_project):
+            st.caption(f"Last updated: {st.session_state.last_index_update[selected_project]}")
     
     # Display pending docs notification
-    if 'pending_docs' in st.session_state and st.session_state.pending_docs:
-        st.warning(f"⚠️ {len(st.session_state.pending_docs)} document(s) not indexed yet. Click 'Rebuild Index' to include them.")
+    if selected_project and selected_project in st.session_state.pending_docs and st.session_state.pending_docs[selected_project]:
+        st.warning(f"⚠️ {len(st.session_state.pending_docs[selected_project])} document(s) not indexed yet. Click 'Rebuild Index' to include them.")
     
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Check for New Docs"):
-            new_files = check_for_new_documents(doc_dir)
+            if selected_project:
+                new_files = check_for_new_documents(os.path.join(doc_root, selected_project), selected_project)
+            else:
+                new_files = []
             if new_files:
-                st.session_state.pending_docs = new_files
+                # Initialize pending_docs for this project if it doesn't exist
+                if selected_project not in st.session_state.pending_docs:
+                    st.session_state.pending_docs[selected_project] = []
+                st.session_state.pending_docs[selected_project] = new_files
                 st.warning(f"Found {len(new_files)} new document(s): {', '.join(new_files)}")
             else:
                 st.success("No new documents found")
-                st.session_state.pending_docs = []
+                if selected_project:
+                    if selected_project not in st.session_state.pending_docs:
+                        st.session_state.pending_docs[selected_project] = []
+                    else:
+                        st.session_state.pending_docs[selected_project] = []
     
     with col2:
         if st.button("Rebuild Index"):
             with st.spinner("Rebuilding index..."):
                 st.session_state.rebuild_index = True
-                st.session_state.pending_docs = []
+                if selected_project:
+                    st.session_state.pending_docs[selected_project] = []
     
     # Display LangSmith status
     st.markdown("### LangSmith Integration")
@@ -234,8 +305,10 @@ It uses query analysis to route between web search for recent events and RAG for
 """)
 
 # Initialize session state variables
-if 'retriever' not in st.session_state:
-    st.session_state.retriever = None
+if 'retrievers' not in st.session_state:
+    st.session_state.retrievers = {}
+if 'current_project' not in st.session_state:
+    st.session_state.current_project = None
 if 'app' not in st.session_state:
     st.session_state.app = None
 if 'rebuild_index' not in st.session_state:
@@ -249,17 +322,17 @@ if 'execution_trace' not in st.session_state:
 if 'graph_image' not in st.session_state:
     st.session_state.graph_image = None
 if 'new_docs_added' not in st.session_state:
-    st.session_state.new_docs_added = []
-if 'total_docs' not in st.session_state:
-    st.session_state.total_docs = 0
+    st.session_state.new_docs_added = {}
+if 'project_doc_counts' not in st.session_state:
+    st.session_state.project_doc_counts = {}
 if 'pending_docs' not in st.session_state:
-    st.session_state.pending_docs = []
+    st.session_state.pending_docs = {}
 if 'last_index_update' not in st.session_state:
-    st.session_state.last_index_update = None
+    st.session_state.last_index_update = {}
 
 # Create or load index
 @st.cache_resource
-def initialize_index(doc_dir, db_dir, rebuild=False):
+def initialize_index(doc_dir, db_dir, rebuild=False, project=None):
     # 1) Find all files
     all_files = glob.glob(os.path.join(doc_dir, "**", "*"), recursive=True)
     
@@ -312,45 +385,68 @@ def initialize_index(doc_dir, db_dir, rebuild=False):
             vs.persist()
             existing_count = len(existing) if existing else 0
             doc_count = existing_count + len(chunks)
-            st.session_state.new_docs_added = new_file_paths
-            st.session_state.total_docs = doc_count
-            st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
+            if project is not None:
+                st.session_state.new_docs_added[project] = new_file_paths
+                st.session_state.project_doc_counts[project] = doc_count
+                st.session_state.last_index_update[project] = time.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                st.session_state.new_docs_added = new_file_paths
+                st.session_state.total_docs = doc_count
+                st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
         else:
             doc_count = len(existing) if existing else 0
-            st.session_state.new_docs_added = []
-            st.session_state.total_docs = doc_count
+            if project is not None:
+                st.session_state.new_docs_added[project] = []
+                st.session_state.project_doc_counts[project] = doc_count
+            else:
+                st.session_state.new_docs_added = []
+                st.session_state.total_docs = doc_count
     else:
         doc_count = sum(1 for _ in existing)
-        st.session_state.new_docs_added = []
-        st.session_state.total_docs = doc_count
+        if project is not None:
+            st.session_state.new_docs_added[project] = []
+            st.session_state.project_doc_counts[project] = doc_count
+        else:
+            st.session_state.new_docs_added = []
+            st.session_state.total_docs = doc_count
         
         # Update timestamp only if it's a rebuild
         if rebuild:
-            st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
+            if project is not None:
+                st.session_state.last_index_update[project] = time.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
     
     # 9) Build retriever
     retriever = vs.as_retriever()
-    
-    return retriever, doc_count
+
+    return retriever, doc_count, new_file_paths
+
+# Create or load indexes for all project folders
+def initialize_project_indexes(doc_root, db_root, rebuild=False):
+    projects = [d for d in os.listdir(doc_root) if os.path.isdir(os.path.join(doc_root, d))]
+    retrievers = {}
+    counts = {}
+    for project in projects:
+        proj_doc = os.path.join(doc_root, project)
+        proj_db = os.path.join(db_root, project)
+        retr, cnt, _ = initialize_index(proj_doc, proj_db, rebuild=rebuild, project=project)
+        retrievers[project] = retr
+        counts[project] = cnt
+    return retrievers, counts
 
 # Initialize the components for the LangGraph
 @st.cache_resource(show_spinner=False)
 def initialize_langgraph(local_llm):
     # LLM
-    llm = ChatOllama(model=local_llm, format="json", temperature=0)
-    
+    llm = ChatOllama(model=local_llm, format="json", temperature=0, verbose=False)
     # Router
     router_prompt = PromptTemplate(
-        template="""You are an expert at routing a user question to a vectorstore or web search. \n
-        Use the vectorstore for questions on laser comm, budget, orbits etc.. \n
-        You do not need to be stringent with the keywords in the question related to these topics. \n
-        Otherwise, use web-search. Give a binary choice 'web_search' or 'vectorstore' based on the question. \n
-        Return the a JSON with a single key 'datasource' and no premable or explanation. \n
-        Question to route: {question}""",
+        template="""You are a question router. By default, route to 'vectorstore'. Only route to 'web_search' if the question explicitly requests recent or breaking information (e.g., contains words like 'today', 'latest', 'recent', 'news', 'current') or explicitly asks for web search. Return a JSON with a single key 'datasource' whose value is either 'vectorstore' or 'web_search', with no preamble or explanation. Question: {question}""",
         input_variables=["question"],
     )
     question_router = router_prompt | llm | JsonOutputParser()
-    
+
     # Retrieval Grader
     grader_prompt = PromptTemplate(
         template="""You are a grader assessing relevance of a retrieved document to a user question. \n 
@@ -363,40 +459,23 @@ def initialize_langgraph(local_llm):
         input_variables=["question", "document"],
     )
     retrieval_grader = grader_prompt | llm | JsonOutputParser()
-    
+
     # Generate
     rag_prompt = hub.pull("rlm/rag-prompt")
-    gen_llm = ChatOllama(model=local_llm, temperature=0)
+    gen_llm = ChatOllama(model=local_llm, temperature=0, verbose=False)
     rag_chain = rag_prompt | gen_llm | StrOutputParser()
-    
-    # Hallucination Grader
-    hallucination_prompt = PromptTemplate(
-        template="""You are a grader assessing whether an answer is grounded in / supported by a set of facts. \n 
-        Here are the facts:
-        \n ------- \n
-        {documents} 
-        \n ------- \n
-        Here is the answer: {generation}
-        Give a binary score 'yes' or 'no' score to indicate whether the answer is grounded in / supported by a set of facts. \n
-        Provide the binary score as a JSON with a single key 'score' and no preamble or explanation.""",
-        input_variables=["generation", "documents"],
+
+    # Final grader (combines factual support and usefulness)
+    final_grader_prompt = PromptTemplate(
+        template="""You are a grader that assesses whether an answer is both grounded in the provided facts and useful to resolve the user's question. 
+Here are the facts (documents): {documents} 
+Here is the answer: {generation} 
+Here is the question: {question}
+Return exactly one of "useful", "not useful", or "not supported" in JSON format as {{"result": "<choice>"}} with no explanation.""",
+        input_variables=["documents", "generation", "question"],
     )
-    hallucination_grader = hallucination_prompt | llm | JsonOutputParser()
-    
-    # Answer Grader
-    answer_prompt = PromptTemplate(
-        template="""You are a grader assessing whether an answer is useful to resolve a question. \n 
-        Here is the answer:
-        \n ------- \n
-        {generation} 
-        \n ------- \n
-        Here is the question: {question}
-        Give a binary score 'yes' or 'no' to indicate whether the answer is useful to resolve a question. \n
-        Provide the binary score as a JSON with a single key 'score' and no preamble or explanation.""",
-        input_variables=["generation", "question"],
-    )
-    answer_grader = answer_prompt | llm | JsonOutputParser()
-    
+    final_grader = final_grader_prompt | llm | JsonOutputParser()
+
     # Question Re-writer
     rewrite_prompt = PromptTemplate(
         template="""You are a question re-writer that converts an input question to a better version that is optimized \n 
@@ -405,10 +484,10 @@ def initialize_langgraph(local_llm):
         input_variables=["question"],
     )
     question_rewriter = rewrite_prompt | llm | StrOutputParser()
-    
+
     # Web Search Tool
     web_search_tool = TavilySearchResults(k=3)
-    
+
     # Define the GraphState
     class GraphState(TypedDict):
         """
@@ -416,13 +495,13 @@ def initialize_langgraph(local_llm):
 
         Attributes:
             question: question
-            generation: LLM generation
-            documents: list of documents
+            generation: str
+            documents: List[Document]
         """
         question: str
         generation: str
-        documents: List[str]
-    
+        documents: List[Document]
+
     # Define the nodes
     def retrieve(state):
         """Retrieve documents from vector store"""
@@ -475,9 +554,10 @@ def initialize_langgraph(local_llm):
         st.session_state.execution_trace.append("route_question")
         question = state["question"]
         source = question_router.invoke({"question": question})
-        if source["datasource"] == "web_search":
+        source = {k.strip(): v for k, v in source.items()}
+        if source.get("datasource") == "web_search":
             return "web_search"
-        elif source["datasource"] == "vectorstore":
+        elif source.get("datasource") == "vectorstore":
             return "vectorstore"
 
     def decide_to_generate(state):
@@ -490,35 +570,28 @@ def initialize_langgraph(local_llm):
             return "generate"
 
     def grade_generation_v_documents_and_question(state):
-        """Grade generation against documents and question"""
         st.session_state.execution_trace.append("grade_generation")
         question = state["question"]
         documents = state["documents"]
         generation = state["generation"]
-        
-        score = hallucination_grader.invoke({"documents": documents, "generation": generation})
-        grade = score["score"]
-        
-        if grade == "yes":
-            score = answer_grader.invoke({"question": question, "generation": generation})
-            grade = score["score"]
-            if grade == "yes":
-                return "useful"
-            else:
-                return "not useful"
-        else:
-            return "not supported"
-    
+        score = final_grader.invoke({
+            "documents": documents,
+            "generation": generation,
+            "question": question
+        })
+        result = score.get("result", "not supported")
+        return result if result in ("useful", "not useful", "not supported") else "not supported"
+
     # Build the graph
     workflow = StateGraph(GraphState)
-    
+
     # Add nodes
     workflow.add_node("web_search", web_search)
     workflow.add_node("retrieve", retrieve)
     workflow.add_node("grade_documents", grade_documents)
     workflow.add_node("generate", generate)
     workflow.add_node("transform_query", transform_query)
-    
+
     # Build graph edges
     workflow.add_conditional_edges(
         START,
@@ -543,50 +616,51 @@ def initialize_langgraph(local_llm):
         "generate",
         grade_generation_v_documents_and_question,
         {
-            "not supported": "generate",
             "useful": END,
             "not useful": "transform_query",
+            "not supported": "transform_query",
         },
     )
-    
+
     # Compile the graph
     app = workflow.compile(
         name="Adaptive RAG with Local LLM",
         checkpointer=None,
     )
-    
+
     # Generate the graph visualization
     try:
         graph_img_bytes = app.get_graph().draw_mermaid_png()
     except Exception as e:
         print(f"Warning: Could not generate graph visualization: {str(e)}")
         graph_img_bytes = None
-    
-    return app, question_router, retrieval_grader, rag_chain, hallucination_grader, answer_grader, question_rewriter, graph_img_bytes
+
+    return app, question_router, retrieval_grader, rag_chain, None, None, question_rewriter, graph_img_bytes
 
 # Initialize the document index and langgraph
 try:
-    # Check if we need to rebuild the index
-    if st.session_state.rebuild_index:
-        retriever, doc_count = initialize_index(doc_dir, db_dir)
-        st.session_state.retriever = retriever
-        st.session_state.doc_count = doc_count
+    if st.session_state.rebuild_index or not st.session_state.retrievers:
+        retrievers, counts = initialize_project_indexes(doc_root, db_root, rebuild=st.session_state.rebuild_index)
+        st.session_state.retrievers = retrievers
+        st.session_state.project_doc_counts = counts
         st.session_state.rebuild_index = False
-        
-        # Display new document indicator after rebuild
-        if st.session_state.new_docs_added:
-            st.success(f"✨ Added {len(st.session_state.new_docs_added)} new document(s) to index: {', '.join(st.session_state.new_docs_added)}")
-        st.success(f"Successfully rebuilt index with {doc_count} document chunks")
-    elif not st.session_state.retriever:
-        retriever, doc_count = initialize_index(doc_dir, db_dir)
-        st.session_state.retriever = retriever
-        st.session_state.doc_count = doc_count
-        
-        # Display new document indicator
-        if st.session_state.new_docs_added:
-            st.success(f"✨ Added {len(st.session_state.new_docs_added)} new document(s) to index: {', '.join(st.session_state.new_docs_added)}")
-        st.info(f"Loaded index with {doc_count} document chunks")
-    
+
+        if selected_project and st.session_state.new_docs_added.get(selected_project):
+            added = st.session_state.new_docs_added[selected_project]
+            st.success(f"✨ Added {len(added)} new document(s) to index: {', '.join(added)}")
+        if selected_project:
+            st.success(f"Successfully built index for {selected_project} with {counts.get(selected_project,0)} document chunks")
+    elif selected_project and selected_project not in st.session_state.retrievers:
+        retrievers, counts = initialize_project_indexes(doc_root, db_root)
+        st.session_state.retrievers.update(retrievers)
+        st.session_state.project_doc_counts.update(counts)
+
+    # Set active retriever
+    if selected_project:
+        st.session_state.retriever = st.session_state.retrievers.get(selected_project)
+    else:
+        st.session_state.retriever = None
+
     # Initialize the LangGraph components
     if st.session_state.retriever and not st.session_state.app:
         with st.spinner("Initializing Adaptive RAG components..."):
