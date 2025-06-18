@@ -471,7 +471,7 @@ def initialize_langgraph(local_llm):
 Here are the facts (documents): {documents} 
 Here is the answer: {generation} 
 Here is the question: {question}
-Return exactly one of "useful", "not useful", or "not supported" in JSON format as {"result": "<choice>"} with no explanation.""",
+Return exactly one of "useful", "not useful", or "not supported" in JSON format as {{"result": "<choice>"}} with no explanation.""",
         input_variables=["documents", "generation", "question"],
     )
     final_grader = final_grader_prompt | llm | JsonOutputParser()
