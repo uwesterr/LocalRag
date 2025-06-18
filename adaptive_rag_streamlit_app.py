@@ -439,20 +439,14 @@ def initialize_project_indexes(doc_root, db_root, rebuild=False):
 @st.cache_resource(show_spinner=False)
 def initialize_langgraph(local_llm):
     # LLM
-    llm = ChatOllama(model=local_llm, format="json", temperature=0)
-    
+    llm = ChatOllama(model=local_llm, format="json", temperature=0, verbose=False)
     # Router
     router_prompt = PromptTemplate(
-        template="""You are an expert at routing a user question to a vectorstore or web search. \n
-        Use the vectorstore for questions on laser comm, budget, orbits etc.. \n
-        You do not need to be stringent with the keywords in the question related to these topics. \n
-        Otherwise, use web-search. Give a binary choice 'web_search' or 'vectorstore' based on the question. \n
-        Return the a JSON with a single key 'datasource' and no premable or explanation. \n
-        Question to route: {question}""",
+        template="""You are a question router. By default, route to 'vectorstore'. Only route to 'web_search' if the question explicitly requests recent or breaking information (e.g., contains words like 'today', 'latest', 'recent', 'news', 'current') or explicitly asks for web search. Return a JSON with a single key 'datasource' whose value is either 'vectorstore' or 'web_search', with no preamble or explanation. Question: {question}""",
         input_variables=["question"],
     )
     question_router = router_prompt | llm | JsonOutputParser()
-    
+
     # Retrieval Grader
     grader_prompt = PromptTemplate(
         template="""You are a grader assessing relevance of a retrieved document to a user question. \n 
@@ -465,40 +459,23 @@ def initialize_langgraph(local_llm):
         input_variables=["question", "document"],
     )
     retrieval_grader = grader_prompt | llm | JsonOutputParser()
-    
+
     # Generate
     rag_prompt = hub.pull("rlm/rag-prompt")
-    gen_llm = ChatOllama(model=local_llm, temperature=0)
+    gen_llm = ChatOllama(model=local_llm, temperature=0, verbose=False)
     rag_chain = rag_prompt | gen_llm | StrOutputParser()
-    
-    # Hallucination Grader
-    hallucination_prompt = PromptTemplate(
-        template="""You are a grader assessing whether an answer is grounded in / supported by a set of facts. \n 
-        Here are the facts:
-        \n ------- \n
-        {documents} 
-        \n ------- \n
-        Here is the answer: {generation}
-        Give a binary score 'yes' or 'no' score to indicate whether the answer is grounded in / supported by a set of facts. \n
-        Provide the binary score as a JSON with a single key 'score' and no preamble or explanation.""",
-        input_variables=["generation", "documents"],
+
+    # Final grader (combines factual support and usefulness)
+    final_grader_prompt = PromptTemplate(
+        template="""You are a grader that assesses whether an answer is both grounded in the provided facts and useful to resolve the user's question. 
+Here are the facts (documents): {documents} 
+Here is the answer: {generation} 
+Here is the question: {question}
+Return exactly one of "useful", "not useful", or "not supported" in JSON format as {"result": "<choice>"} with no explanation.""",
+        input_variables=["documents", "generation", "question"],
     )
-    hallucination_grader = hallucination_prompt | llm | JsonOutputParser()
-    
-    # Answer Grader
-    answer_prompt = PromptTemplate(
-        template="""You are a grader assessing whether an answer is useful to resolve a question. \n 
-        Here is the answer:
-        \n ------- \n
-        {generation} 
-        \n ------- \n
-        Here is the question: {question}
-        Give a binary score 'yes' or 'no' to indicate whether the answer is useful to resolve a question. \n
-        Provide the binary score as a JSON with a single key 'score' and no preamble or explanation.""",
-        input_variables=["generation", "question"],
-    )
-    answer_grader = answer_prompt | llm | JsonOutputParser()
-    
+    final_grader = final_grader_prompt | llm | JsonOutputParser()
+
     # Question Re-writer
     rewrite_prompt = PromptTemplate(
         template="""You are a question re-writer that converts an input question to a better version that is optimized \n 
@@ -507,10 +484,10 @@ def initialize_langgraph(local_llm):
         input_variables=["question"],
     )
     question_rewriter = rewrite_prompt | llm | StrOutputParser()
-    
+
     # Web Search Tool
     web_search_tool = TavilySearchResults(k=3)
-    
+
     # Define the GraphState
     class GraphState(TypedDict):
         """
@@ -524,7 +501,7 @@ def initialize_langgraph(local_llm):
         question: str
         generation: str
         documents: List[Document]
-    
+
     # Define the nodes
     def retrieve(state):
         """Retrieve documents from vector store"""
@@ -593,35 +570,28 @@ def initialize_langgraph(local_llm):
             return "generate"
 
     def grade_generation_v_documents_and_question(state):
-        """Grade generation against documents and question"""
         st.session_state.execution_trace.append("grade_generation")
         question = state["question"]
         documents = state["documents"]
         generation = state["generation"]
-        
-        score = hallucination_grader.invoke({"documents": documents, "generation": generation})
-        grade = score["score"]
-        
-        if grade == "yes":
-            score = answer_grader.invoke({"question": question, "generation": generation})
-            grade = score["score"]
-            if grade == "yes":
-                return "useful"
-            else:
-                return "not useful"
-        else:
-            return "not supported"
-    
+        score = final_grader.invoke({
+            "documents": documents,
+            "generation": generation,
+            "question": question
+        })
+        result = score.get("result", "not supported")
+        return result if result in ("useful", "not useful", "not supported") else "not supported"
+
     # Build the graph
     workflow = StateGraph(GraphState)
-    
+
     # Add nodes
     workflow.add_node("web_search", web_search)
     workflow.add_node("retrieve", retrieve)
     workflow.add_node("grade_documents", grade_documents)
     workflow.add_node("generate", generate)
     workflow.add_node("transform_query", transform_query)
-    
+
     # Build graph edges
     workflow.add_conditional_edges(
         START,
@@ -646,26 +616,26 @@ def initialize_langgraph(local_llm):
         "generate",
         grade_generation_v_documents_and_question,
         {
-            "not supported": "generate",
             "useful": END,
             "not useful": "transform_query",
+            "not supported": "transform_query",
         },
     )
-    
+
     # Compile the graph
     app = workflow.compile(
         name="Adaptive RAG with Local LLM",
         checkpointer=None,
     )
-    
+
     # Generate the graph visualization
     try:
         graph_img_bytes = app.get_graph().draw_mermaid_png()
     except Exception as e:
         print(f"Warning: Could not generate graph visualization: {str(e)}")
         graph_img_bytes = None
-    
-    return app, question_router, retrieval_grader, rag_chain, hallucination_grader, answer_grader, question_rewriter, graph_img_bytes
+
+    return app, question_router, retrieval_grader, rag_chain, None, None, question_rewriter, graph_img_bytes
 
 # Initialize the document index and langgraph
 try:
