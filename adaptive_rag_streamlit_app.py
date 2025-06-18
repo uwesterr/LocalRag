@@ -12,8 +12,8 @@ import time
 # LangChain imports
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_nomic.embeddings import NomicEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.document_loaders import TextLoader, PyPDFLoader
+from langchain_community.vectorstores import Chroma
+from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain.prompts import PromptTemplate
 from langchain_community.chat_models import ChatOllama
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
@@ -74,30 +74,80 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Check for new documents
-def check_for_new_documents(doc_dir, project):
-    """Check if there are new documents in a project directory that haven't been indexed yet"""
-    if 'retrievers' not in st.session_state or project not in st.session_state.retrievers:
+# Initialize session state variables
+if 'retrievers' not in st.session_state: st.session_state.retrievers = {}
+if 'current_project' not in st.session_state: st.session_state.current_project = None
+if 'app' not in st.session_state: st.session_state.app = None
+if 'rebuild_index' not in st.session_state: st.session_state.rebuild_index = False
+if 'question_history' not in st.session_state: st.session_state.question_history = []
+if 'answer_history' not in st.session_state: st.session_state.answer_history = []
+if 'execution_trace' not in st.session_state: st.session_state.execution_trace = []
+if 'graph_image' not in st.session_state: st.session_state.graph_image = None
+if 'new_docs_added' not in st.session_state: st.session_state.new_docs_added = {}
+if 'project_doc_counts' not in st.session_state: st.session_state.project_doc_counts = {}
+if 'pending_docs' not in st.session_state: st.session_state.pending_docs = {}
+if 'last_index_update' not in st.session_state: st.session_state.last_index_update = {}
+
+def check_for_new_documents(doc_dir, project=None):
+    """
+    Check for new documents in the specified directory that haven't been indexed yet.
+    
+    Args:
+        doc_dir (str): Directory to check for documents
+        project (str, optional): Project name for tracking in session state
+    
+    Returns:
+        list: List of new document filenames
+    """
+    if not os.path.exists(doc_dir):
         return []
     
-    all_files = glob.glob(os.path.join(doc_dir, "**", "*"), recursive=True)
+    # Get all document files in the directory
+    all_files = []
+    for ext in [".pdf", ".txt", ".md", ".docx"]:
+        all_files.extend(glob.glob(os.path.join(doc_dir, "**", f"*{ext}"), recursive=True))
     
-    # Get existing documents from the vector store
-    try:
-        vs = st.session_state.retrievers[project].vectorstore
-        existing = {md.get("source") for md in vs.get()["metadatas"] or []}
+    # Get the relative paths for easier display
+    all_files = [os.path.relpath(f, doc_dir) for f in all_files]
+    
+    # Check which files are already indexed
+    if project is not None:
+        # For multi-project setup
+        retriever = st.session_state.retrievers.get(project)
+        if retriever is None:
+            return all_files  # If retriever not initialized, all files are "new"
         
-        # Find new documents
-        new_files = []
-        for fp in all_files:
-            if os.path.isfile(fp) and fp not in existing:
-                new_files.append(os.path.basename(fp))
-        
-        if new_files:
-            st.session_state.rebuild_index = True
-        return new_files
-    except:
-        return []
+        # Get indexed files from the retriever
+        try:
+            vs = retriever.vectorstore
+            indexed_files = {
+                os.path.relpath(md.get("source", ""), doc_dir) 
+                for md in vs.get()["metadatas"] or []
+                if md and "source" in md
+            }
+        except Exception as e:
+            st.error(f"Error checking indexed files: {str(e)}")
+            return []
+    else:
+        # For single project setup
+        if 'retriever' not in st.session_state or st.session_state.retriever is None:
+            return all_files
+            
+        try:
+            vs = st.session_state.retriever.vectorstore
+            indexed_files = {
+                os.path.relpath(md.get("source", ""), doc_dir) 
+                for md in vs.get()["metadatas"] or []
+                if md and "source" in md
+            }
+        except Exception as e:
+            st.error(f"Error checking indexed files: {str(e)}")
+            return []
+    
+    # Find files that aren't indexed
+    new_files = [f for f in all_files if f not in indexed_files]
+    
+    return new_files
 
 # Sidebar: setup and configuration
 with st.sidebar:
@@ -114,7 +164,7 @@ with st.sidebar:
         lines = result.stdout.strip().splitlines()
         if lines and "MODEL" in lines[0].upper() or "NAME" in lines[0].upper():
             lines = lines[1:]  # Skip header row
-            
+
         # Parse model names exactly as they appear in Ollama list output
         available_models = []
         for line in lines:
@@ -122,7 +172,8 @@ with st.sidebar:
                 # Extract the full model name with tag (e.g., "llama3:latest")
                 model_name = line.split()[0]
                 available_models.append({"display": model_name, "value": model_name})
-        
+        # Exclude non-chat (embedding) models
+        available_models = [m for m in available_models if "embed-text" not in m["value"]]
         # If no models were found, use defaults
         if not available_models:
             available_models = [
@@ -170,7 +221,7 @@ with st.sidebar:
     st.session_state.current_project = selected_project
     
     # Display index statistics
-    if selected_project and selected_project in st.session_state.project_doc_counts:
+    if selected_project:
         count = st.session_state.project_doc_counts.get(selected_project, 0)
         st.info(f"📚 Current index for {selected_project} contains {count} document chunks")
 
@@ -190,12 +241,18 @@ with st.sidebar:
             else:
                 new_files = []
             if new_files:
+                # Initialize pending_docs for this project if it doesn't exist
+                if selected_project not in st.session_state.pending_docs:
+                    st.session_state.pending_docs[selected_project] = []
                 st.session_state.pending_docs[selected_project] = new_files
                 st.warning(f"Found {len(new_files)} new document(s): {', '.join(new_files)}")
             else:
                 st.success("No new documents found")
                 if selected_project:
-                    st.session_state.pending_docs[selected_project] = []
+                    if selected_project not in st.session_state.pending_docs:
+                        st.session_state.pending_docs[selected_project] = []
+                    else:
+                        st.session_state.pending_docs[selected_project] = []
     
     with col2:
         if st.button("Rebuild Index"):
@@ -461,12 +518,12 @@ def initialize_langgraph(local_llm):
 
         Attributes:
             question: question
-            generation: LLM generation
-            documents: list of documents
+            generation: str
+            documents: List[Document]
         """
         question: str
         generation: str
-        documents: List[str]
+        documents: List[Document]
     
     # Define the nodes
     def retrieve(state):
@@ -520,9 +577,10 @@ def initialize_langgraph(local_llm):
         st.session_state.execution_trace.append("route_question")
         question = state["question"]
         source = question_router.invoke({"question": question})
-        if source["datasource"] == "web_search":
+        source = {k.strip(): v for k, v in source.items()}
+        if source.get("datasource") == "web_search":
             return "web_search"
-        elif source["datasource"] == "vectorstore":
+        elif source.get("datasource") == "vectorstore":
             return "vectorstore"
 
     def decide_to_generate(state):
