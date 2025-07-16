@@ -1,0 +1,6 @@
+docs/EAGLE1-SCP-TCO-ESA-0062_OpticalLinkICD_C_signed.pdf
+*.pdf
+*.bin
+*chroma.sqlite3
+*.pickle
+*.ipynb
