@@ -1,5 +1,8 @@
+# source ~/envs/py312/bin/activate
 import streamlit as st
 import os
+os.environ["LANGSMITH_HIDE_INPUTS"] = "true"
+os.environ["LANGSMITH_HIDE_OUTPUTS"] = "true"
 import glob
 import uuid
 import io
@@ -13,6 +16,7 @@ import time
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_nomic.embeddings import NomicEmbeddings
 from langchain_community.vectorstores import Chroma
+from chromadb.config import Settings
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain.prompts import PromptTemplate
 from langchain_community.chat_models import ChatOllama
@@ -24,6 +28,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from langgraph.graph import END, StateGraph, START
 from typing import List, Dict, Any
 from typing_extensions import TypedDict
+from sentence_transformers import CrossEncoder
 from langsmith import Client
 from IPython.display import Image as IPythonImage
 from PIL import Image
@@ -338,6 +343,8 @@ def initialize_index(doc_dir, db_dir, rebuild=False, project=None):
     
     # 2) Init embeddings
     emb = NomicEmbeddings(model="nomic-embed-text-v1.5", inference_mode="local")
+    # HNSW settings for more precise indexing and search
+    settings = Settings(hnsw_ef_construction=200, hnsw_ef_search=64, hnsw_m=32)
     
     # 3) Create or load vector store
     if rebuild:
@@ -346,15 +353,15 @@ def initialize_index(doc_dir, db_dir, rebuild=False, project=None):
             import shutil
             shutil.rmtree(db_dir)
         
-        vs = Chroma.from_documents([], emb, persist_directory=db_dir, collection_name="rag-chroma")
+        vs = Chroma.from_documents([], emb, client_settings=settings, persist_directory=db_dir, collection_name="rag-chroma")
         existing = set()
     else:
         try:
-            vs = Chroma(persist_directory=db_dir, embedding_function=emb, collection_name="rag-chroma")
+            vs = Chroma(persist_directory=db_dir, embedding_function=emb, client_settings=settings, collection_name="rag-chroma")
             existing = {md.get("source") for md in vs.get()["metadatas"] or []}
         except:
             os.makedirs(db_dir, exist_ok=True)
-            vs = Chroma(persist_directory=db_dir, embedding_function=emb, collection_name="rag-chroma")
+            vs = Chroma(persist_directory=db_dir, embedding_function=emb, client_settings=settings, collection_name="rag-chroma")
             existing = set()
     
     # 4) Loader factory
@@ -378,21 +385,24 @@ def initialize_index(doc_dir, db_dir, rebuild=False, project=None):
             new_docs += load_path(fp)
     
     if new_docs:
-        splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=250, chunk_overlap=0)
+        splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=250, chunk_overlap=50)
         chunks = splitter.split_documents(new_docs)
         if chunks:
-            vs.add_documents(chunks)
-            vs.persist()
-            existing_count = len(existing) if existing else 0
-            doc_count = existing_count + len(chunks)
-            if project is not None:
-                st.session_state.new_docs_added[project] = new_file_paths
-                st.session_state.project_doc_counts[project] = doc_count
-                st.session_state.last_index_update[project] = time.strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                st.session_state.new_docs_added = new_file_paths
-                st.session_state.total_docs = doc_count
-                st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
+                # Add documents in batches to avoid exceeding Chroma's max batch size
+                max_batch_size = 5461
+                for i in range(0, len(chunks), max_batch_size):
+                    vs.add_documents(chunks[i:i+max_batch_size])
+                vs.persist()
+                existing_count = len(existing) if existing else 0
+                doc_count = existing_count + len(chunks)
+                if project is not None:
+                    st.session_state.new_docs_added[project] = new_file_paths
+                    st.session_state.project_doc_counts[project] = doc_count
+                    st.session_state.last_index_update[project] = time.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    st.session_state.new_docs_added = new_file_paths
+                    st.session_state.total_docs = doc_count
+                    st.session_state.last_index_update = time.strftime("%Y-%m-%d %H:%M:%S")
         else:
             doc_count = len(existing) if existing else 0
             if project is not None:
@@ -440,6 +450,8 @@ def initialize_project_indexes(doc_root, db_root, rebuild=False):
 def initialize_langgraph(local_llm):
     # LLM
     llm = ChatOllama(model=local_llm, format="json", temperature=0, verbose=False)
+    # Reranker for retrieved documents
+    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
     # Router
     router_prompt = PromptTemplate(
         template="""You are a question router. By default, route to 'vectorstore'. Only route to 'web_search' if the question explicitly requests recent or breaking information (e.g., contains words like 'today', 'latest', 'recent', 'news', 'current') or explicitly asks for web search. Return a JSON with a single key 'datasource' whose value is either 'vectorstore' or 'web_search', with no preamble or explanation. Question: {question}""",
@@ -508,6 +520,10 @@ Return exactly one of "useful", "not useful", or "not supported" in JSON format 
         st.session_state.execution_trace.append("retrieve")
         question = state["question"]
         documents = st.session_state.retriever.get_relevant_documents(question)
+        # Rerank retrieved documents with cross-encoder
+        pairs = [(question, d.page_content) for d in documents]
+        scores = reranker.predict(pairs)
+        documents = [d for _, d in sorted(zip(scores, documents), reverse=True)]
         return {"documents": documents, "question": question}
 
     def generate(state):
