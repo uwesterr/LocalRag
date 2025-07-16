@@ -16,7 +16,6 @@ import time
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_nomic.embeddings import NomicEmbeddings
 from langchain_community.vectorstores import Chroma
-from chromadb.config import Settings
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain.prompts import PromptTemplate
 from langchain_community.chat_models import ChatOllama
@@ -343,8 +342,8 @@ def initialize_index(doc_dir, db_dir, rebuild=False, project=None):
     
     # 2) Init embeddings
     emb = NomicEmbeddings(model="nomic-embed-text-v1.5", inference_mode="local")
-    # HNSW settings for more precise indexing and search
-    settings = Settings(hnsw_ef_construction=200, hnsw_ef_search=64, hnsw_m=32)
+    # HNSW metadata configuration
+    hnsw_metadata = {"hnsw:construction_ef": 200, "hnsw:M": 32, "hnsw:search_ef": 64}
     
     # 3) Create or load vector store
     if rebuild:
@@ -352,16 +351,16 @@ def initialize_index(doc_dir, db_dir, rebuild=False, project=None):
         if os.path.exists(db_dir):
             import shutil
             shutil.rmtree(db_dir)
-        
-        vs = Chroma.from_documents([], emb, client_settings=settings, persist_directory=db_dir, collection_name="rag-chroma")
+
+        vs = Chroma.from_documents([], emb, persist_directory=db_dir, collection_name="rag-chroma", collection_metadata=hnsw_metadata)
         existing = set()
     else:
         try:
-            vs = Chroma(persist_directory=db_dir, embedding_function=emb, client_settings=settings, collection_name="rag-chroma")
+            vs = Chroma(persist_directory=db_dir, embedding_function=emb, collection_name="rag-chroma")
             existing = {md.get("source") for md in vs.get()["metadatas"] or []}
         except:
             os.makedirs(db_dir, exist_ok=True)
-            vs = Chroma(persist_directory=db_dir, embedding_function=emb, client_settings=settings, collection_name="rag-chroma")
+            vs = Chroma.from_documents([], emb, persist_directory=db_dir, collection_name="rag-chroma", collection_metadata=hnsw_metadata)
             existing = set()
     
     # 4) Loader factory
@@ -542,7 +541,7 @@ Return exactly one of "useful", "not useful", or "not supported" in JSON format 
         filtered_docs = []
         for d in documents:
             score = retrieval_grader.invoke({"question": question, "document": d.page_content})
-            grade = score["score"]
+            grade = score.get("score") if isinstance(score, dict) else None
             if grade == "yes":
                 filtered_docs.append(d)
         return {"documents": filtered_docs, "question": question}
@@ -575,6 +574,8 @@ Return exactly one of "useful", "not useful", or "not supported" in JSON format 
             return "web_search"
         elif source.get("datasource") == "vectorstore":
             return "vectorstore"
+        # Default fallback to vectorstore if router output is missing or unrecognized
+        return "vectorstore"
 
     def decide_to_generate(state):
         """Decide whether to generate answer or transform query"""
